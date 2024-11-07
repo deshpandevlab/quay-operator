@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	err "errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -29,6 +31,10 @@ import (
 	v1 "github.com/quay/quay-operator/apis/quay/v1"
 	quaycontext "github.com/quay/quay-operator/pkg/context"
 	"github.com/quay/quay-operator/pkg/kustomize"
+	batchv1 "k8s.io/api/batch/v1"
+	// "k8s.io/apimachinery/pkg/runtime"
+	// "k8s.io/client-go/kubernetes/scheme"
+	// "k8s.io/client-go/tools/remotecommand" // Add this line
 )
 
 const (
@@ -441,6 +447,13 @@ func (r *QuayRegistryReconciler) checkNeedsPostgresUpgradeForComponent(
 	deployedImageName := postgresDeployment.Spec.Template.Spec.Containers[0].Image
 	r.Log.Info(fmt.Sprintf("%s deployment found", component), "image", deployedImageName)
 
+	//if fipsEnabled {
+	// Modify PostgreSQL configuration for FIPS compliance
+	if err := r.modifyPostgresConfigForFIPS(ctx, quay); err != nil {
+		return err, false
+	}
+	// }
+
 	expectedImage, err := kustomize.ComponentImageFor(component)
 	if err != nil {
 		r.Log.Error(err, "failed to get postgres image")
@@ -532,4 +545,135 @@ func getCertificatesPEM(address string) ([]byte, error) {
 	}
 
 	return b.Bytes(), nil
+}
+
+// func (r *QuayRegistryReconciler) isFIPSEnabled(ctx context.Context, quay *v1.QuayRegistry) (bool, error) {
+// 	// Get the PostgreSQL pod
+// 	podList := &corev1.PodList{}
+// 	if err := r.Client.List(ctx, podList, client.InNamespace(quay.Namespace), client.MatchingLabels{"app": "postgres"}); err != nil {
+// 		return false, fmt.Errorf("failed to list PostgreSQL pods: %v", err)
+// 	}
+
+// 	if len(podList.Items) == 0 {
+// 		return false, fmt.Errorf("no PostgreSQL pods found")
+// 	}
+
+// 	// Use the first pod found
+// 	pod := podList.Items[0]
+
+// 	// Create an exec command to check FIPS status
+// 	cmd := []string{"cat", "/proc/sys/crypto/fips_enabled"}
+// 	req := r.KubeClient.CoreV1().RESTClient().Post().
+// 		Resource("pods").
+// 		Name(pod.Name).
+// 		Namespace(pod.Namespace).
+// 		SubResource("exec").
+// 		VersionedParams(&corev1.PodExecOptions{
+// 			Command: cmd,
+// 			Stdout:  true,
+// 			Stderr:  true,
+// 		}, runtime.NewParameterCodec(scheme.Scheme))
+
+// 	// Execute the command
+// 	exec, err := remotecommand.NewSPDYExecutor(r.Config, "POST", req.URL())
+// 	if err != nil {
+// 		return false, fmt.Errorf("failed to create executor: %v", err)
+// 	}
+
+// 	var stdout, stderr bytes.Buffer
+// 	err = exec.Stream(remotecommand.StreamOptions{
+// 		Stdout: &stdout,
+// 		Stderr: &stderr,
+// 	})
+// 	if err != nil {
+// 		return false, fmt.Errorf("failed to execute command: %v", err)
+// 	}
+
+// 	// Check the output
+// 	output := strings.TrimSpace(stdout.String())
+// 	if output == "1" {
+// 		return true, nil
+// 	} else if output == "0" {
+// 		return false, nil
+// 	} else {
+// 		return false, fmt.Errorf("unexpected output from FIPS check: %s", output)
+// 	}
+// }
+
+func (r *QuayRegistryReconciler) modifyPostgresConfigForFIPS(ctx context.Context, quay *v1.QuayRegistry) error {
+	if err := r.createFIPSConfigMap(ctx, quay); err != nil {
+		return err
+	}
+
+	if err := r.runFIPSConfigJob(ctx, quay); err != nil {
+		return err
+	}
+
+	// Wait for the job to complete
+	return r.waitForJobCompletion(ctx, quay)
+}
+
+func (r *QuayRegistryReconciler) createFIPSConfigMap(ctx context.Context, quay *v1.QuayRegistry) error {
+	configMap := &corev1.ConfigMap{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: "fips-postgres-config", Namespace: quay.Namespace}, configMap)
+	if err != nil && errors.IsNotFound(err) {
+		// ConfigMap doesn't exist, create it
+		configMapYAML, err := os.ReadFile("../kustomize/clairpostgres/fips-config-map.yaml")
+		if err != nil {
+			return fmt.Errorf("failed to read ConfigMap YAML: %v", err)
+		}
+
+		var configMapData map[string]interface{}
+		if err := yaml.Unmarshal(configMapYAML, &configMapData); err != nil {
+			return fmt.Errorf("failed to unmarshal ConfigMap YAML: %v", err)
+		}
+
+		if err := r.Client.Create(ctx, &unstructured.Unstructured{Object: configMapData}); err != nil {
+			return fmt.Errorf("failed to create FIPS config ConfigMap: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to check for existing ConfigMap: %v", err)
+	}
+
+	return nil
+}
+
+func (r *QuayRegistryReconciler) runFIPSConfigJob(ctx context.Context, quay *v1.QuayRegistry) error {
+	job := &batchv1.Job{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: "fips-postgres-config-job", Namespace: quay.Namespace}, job)
+	if err != nil && errors.IsNotFound(err) {
+		// Job doesn't exist, create it
+		jobYAML, err := os.ReadFile("path/to/fips-config-job.yaml")
+		if err != nil {
+			return fmt.Errorf("failed to read Job YAML: %v", err)
+		}
+
+		var jobData map[string]interface{}
+		if err := yaml.Unmarshal(jobYAML, &jobData); err != nil {
+			return fmt.Errorf("failed to unmarshal Job YAML: %v", err)
+		}
+
+		if err := r.Client.Create(ctx, &unstructured.Unstructured{Object: jobData}); err != nil {
+			return fmt.Errorf("failed to create FIPS config Job: %v", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("failed to check for existing Job: %v", err)
+	}
+
+	return nil
+}
+
+// waitForJobCompletion waits for the specified job to complete.
+func (r *QuayRegistryReconciler) waitForJobCompletion(ctx context.Context, quay *v1.QuayRegistry) error {
+	jobName := "fips-postgres-config-job"
+	jobNamespace := quay.Namespace
+
+	// Poll until the job is completed
+	return wait.PollUntilContextTimeout(ctx, time.Second, 5*time.Minute, false, func(ctx context.Context) (done bool, err error) {
+		job := &batchv1.Job{}
+		if err := r.Client.Get(ctx, types.NamespacedName{Name: jobName, Namespace: jobNamespace}, job); err != nil {
+			return false, err
+		}
+		return job.Status.Succeeded > 0, nil
+	})
 }
