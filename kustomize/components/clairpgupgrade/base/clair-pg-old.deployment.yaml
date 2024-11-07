@@ -27,37 +27,6 @@ spec:
         - name: postgres-data
           persistentVolumeClaim:
             claimName: clair-postgres-13
-      initContainers:
-      - name: init-postgres-config
-        image: quay.io/sclorg/postgresql-13-c9s:latest
-        command: ["/bin/bash", "-c"]
-        args:
-          - |
-            # Wait for PostgreSQL to be ready
-            until pg_isready; do
-              echo "Waiting for PostgreSQL to be ready..."
-              sleep 2
-            done
-            
-            # Modify configuration files
-            echo "password_encryption = 'scram-sha-256'" >> $PGDATA/postgresql.conf
-            echo "host    all    all    0.0.0.0/0    scram-sha-256" >> $PGDATA/pg_hba.conf
-            
-            # Reload configuration
-            pg_ctl reload
-            
-            # Set password for postgres user
-            psql -c "ALTER USER postgres WITH PASSWORD 'postgres';"
-        env:
-          - name: PGDATA
-            value: /var/lib/pgsql/data
-          - name: PGHOST
-            value: localhost
-          - name: PGUSER
-            value: postgres
-        volumeMounts:
-          - name: postgres-data
-            mountPath: /var/lib/pgsql/data
       containers:
         - name: postgres
           image: quay.io/sclorg/postgresql-13-c9s:latest
@@ -88,3 +57,18 @@ spec:
             requests:
               cpu: 500m
               memory: 2Gi
+          lifecycle:
+            postStart:
+              exec:
+                command: ["/bin/sh", "-c", "
+                  until pg_isready; do
+                    echo 'Waiting for PostgreSQL to start...';
+                    sleep 2;
+                  done;
+                  echo 'password_encryption = scram-sha-256' >> $PGDATA/postgresql.conf;
+                  echo 'host all all 0.0.0.0/0 scram-sha-256' >> $PGDATA/pg_hba.conf;
+                  pg_ctl reload;
+                  psql -c \"ALTER SYSTEM SET password_encryption TO 'scram-sha-256';\";
+                  psql -c \"SELECT pg_reload_conf();\";
+                  psql -c \"ALTER USER postgres WITH PASSWORD 'postgres';\"
+                "]
